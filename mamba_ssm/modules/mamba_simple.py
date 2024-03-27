@@ -62,6 +62,7 @@ class Mamba(nn.Module):
         layer_idx=None,
         device=None,
         dtype=None,
+        num_heads=8,
     ):
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
@@ -70,6 +71,7 @@ class Mamba(nn.Module):
         self.d_state = d_state
         self.d_conv = d_conv
         self.expand = expand
+        self.num_heads = num_heads
 
         self.d_inner_a = int(self.expand * self.d_model_a) # 2 * 64 = 128
         self.d_inner_v = int(self.expand * self.d_model_v) # 2 * 64 = 128
@@ -87,7 +89,6 @@ class Mamba(nn.Module):
         # Output - self.d_inner * 2 = 128 * 2 = 256
         self.in_proj_a = nn.Linear(self.d_model_a, self.d_inner_a * 2, bias=bias, **factory_kwargs)
         self.in_proj_v = nn.Linear(self.d_model_v, self.d_inner_v * 2, bias=bias, **factory_kwargs)
-
 
         self.conv1d_a = nn.Conv1d(
             in_channels=self.d_inner_a,  # the number of channels in the input data
@@ -119,11 +120,10 @@ class Mamba(nn.Module):
             self.d_inner_v, self.dt_rank_v + self.d_state * 2, bias=False, **factory_kwargs
         )
 
-        # print('self.x_proj_a', self.x_proj_a)
-        # print('self.x_proj_v', self.x_proj_v)
-        # print('-------------------------------------')
         self.dt_proj_a = nn.Linear(self.dt_rank_a, self.d_inner_a, bias=True, **factory_kwargs)
         self.dt_proj_v = nn.Linear(self.dt_rank_v, self.d_inner_v, bias=True, **factory_kwargs)
+
+        self.attention = torch.nn.MultiheadAttention(64, self.num_heads)
 
         # Initialize special dt projection to preserve variance at initialization
         dt_init_std_a = self.dt_rank_a**-0.5 * dt_scale
@@ -258,21 +258,24 @@ class Mamba(nn.Module):
 
         A_a = -torch.exp(self.A_log_a.float())  # (d_inner, d_state), shape [128, 16]
         # In the backward pass we write dx and dz next to each other to avoid torch.cat
+        
+        self.use_fast_path = False
+        
         if self.use_fast_path and causal_conv1d_fn is not None and inference_params is None:  # Doesn't support outputting the states
             # print(' 11111111111111111111111 ')
-            out = mamba_inner_fn(
+            out_a = mamba_inner_fn(
                 xz_a,                     # dim, batch, seqlen
-                self.conv1d.weight,
-                self.conv1d.bias,
-                self.x_proj.weight,
-                self.dt_proj.weight,
-                self.out_proj.weight,
-                self.out_proj.bias,
+                self.conv1d_a.weight,
+                self.conv1d_a.bias,
+                self.x_proj_a.weight,
+                self.dt_proj_a.weight,
+                self.out_proj_a.weight,
+                self.out_proj_a.bias,
                 A_a,
                 None,  # input-dependent B
                 None,  # input-dependent C
-                self.D.float(),
-                delta_bias=self.dt_proj.bias.float(),
+                self.D_a.float(),
+                delta_bias=self.dt_proj_a.bias.float(),
                 delta_softplus=True,
             )
         else:
@@ -296,8 +299,8 @@ class Mamba(nn.Module):
                 assert self.activation in ["silu", "swish"]
                 x_a = causal_conv1d_fn(
                     x=x_a,
-                    weight=rearrange(self.conv1d.weight, "d 1 w -> d w"),
-                    bias=self.conv1d.bias,
+                    weight=rearrange(self.conv1d_a.weight, "d 1 w -> d w"),
+                    bias=self.conv1d_a.bias,
                     activation=self.activation,
                 )
 
@@ -310,19 +313,19 @@ class Mamba(nn.Module):
         # In the backward pass we write dx and dz next to each other to avoid torch.cat
         if self.use_fast_path and causal_conv1d_fn is not None and inference_params is None:  # Doesn't support outputting the states
             # print(' 11111111111111111111111 ')
-            out = mamba_inner_fn(
+            out_v= mamba_inner_fn(
                 xz_v,                     # dim, batch, seqlen
-                self.conv1d.weight,
-                self.conv1d.bias,
-                self.x_proj.weight,
-                self.dt_proj.weight,
-                self.out_proj.weight,
-                self.out_proj.bias,
+                self.conv1d_v.weight,
+                self.conv1d_v.bias,
+                self.x_proj_v.weight,
+                self.dt_proj_v.weight,
+                self.out_proj_v.weight,
+                self.out_proj_v.bias,
                 A_v,
                 None,  # input-dependent B
                 None,  # input-dependent C
-                self.D.float(),
-                delta_bias=self.dt_proj.bias.float(),
+                self.D_v.float(),
+                delta_bias=self.dt_proj_v.bias.float(),
                 delta_softplus=True,
             )
         else:
@@ -347,8 +350,8 @@ class Mamba(nn.Module):
                 assert self.activation in ["silu", "swish"]
                 x_v = causal_conv1d_fn(
                     x=x_v,
-                    weight=rearrange(self.conv1d.weight, "d 1 w -> d w"),
-                    bias=self.conv1d.bias,
+                    weight=rearrange(self.conv1d_v.weight, "d 1 w -> d w"),
+                    bias=self.conv1d_v.bias,
                     activation=self.activation,
                 )
 
@@ -442,6 +445,7 @@ class Mamba(nn.Module):
 
             '''
             ----------------------------------------------------
+            Calculate VISUAL output based on audiovisual feature
             '''
             x_dbl_a = self.x_proj_a(rearrange(x_a, "b d l -> (b l) d"))  # (bl d)  #         self.x_proj = nn.Linear(self.d_inner, self.dt_rank + self.d_state * 2, bias=False, **factory_kwargs)
             x_dbl_v = self.x_proj_v(rearrange(x_v, "b d l -> (b l) d"))  # (bl d)  #         self.x_proj = nn.Linear(self.d_inner, self.dt_rank + self.d_state * 2, bias=False, **factory_kwargs)
@@ -451,8 +455,12 @@ class Mamba(nn.Module):
             # print('x_dbl_a.shape', x_dbl_a.shape)
             # print('x_dbl_v.shape', x_dbl_v.shape)
             
-            x_dbl_av = x_dbl_a + x_dbl_v
+            # x_dbl_av = x_dbl_a + x_dbl_v
             # print('x_dbl_av.shape', x_dbl_av.shape)
+
+            attention_output, _ = self.attention(x_dbl_v, x_dbl_a, x_dbl_a)
+
+            x_dbl_av = x_dbl_v + attention_output
 
             dt_av, B_av, C_av = torch.split(x_dbl_av, [self.dt_rank_v, self.d_state, self.d_state], dim=-1)
 
@@ -482,41 +490,44 @@ class Mamba(nn.Module):
             y_av = rearrange(y_av, "b d l -> b l d")
             out_av = self.out_proj_v(y_av)
 
-
             '''
             -----------------------------------------------------------------
+            Calculate AUDIO output based on audiovisual feature
             '''
             x_dbl_a = self.x_proj_a(rearrange(x_a, "b d l -> (b l) d"))  # (bl d)  #         self.x_proj = nn.Linear(self.d_inner, self.dt_rank + self.d_state * 2, bias=False, **factory_kwargs)
             x_dbl_v = self.x_proj_v(rearrange(x_v, "b d l -> (b l) d"))  # (bl d)  #         self.x_proj = nn.Linear(self.d_inner, self.dt_rank + self.d_state * 2, bias=False, **factory_kwargs)
 
-            print('x_dbl_v.shape', x_a.shape)
+            # print('x_dbl_v.shape', x_a.shape)
             a = rearrange(x_a, "b d l -> (b l) d")  # batch, dim, seqlen --> batch*seqlen, dim
-            print('a.shape', a.shape)
-            print('x_dbl_v.shape', x_dbl_a.shape)
+            # print('a.shape', a.shape)
+            # print('x_dbl_v.shape', x_dbl_a.shape)
 
             # assert x_dbl_v.shape[0] % x_dbl_a.shape[0] == 0
             # x_dbl_v_reshaped = x_dbl_v.view(x_dbl_a.shape[0], -1, x_dbl_v.shape[1])
             # x_dbl_v = x_dbl_v_reshaped.mean(dim=1)
             # print('x_dbl_v.shape[0]', x_dbl_v.shape)
 
-            x_dbl_va = x_dbl_a + x_dbl_v
+            # x_dbl_va = x_dbl_a + x_dbl_v
+            attention_output, _ = self.attention(x_dbl_a, x_dbl_v, x_dbl_v)
+
+            x_dbl_va = x_dbl_a + attention_output
 
             dt_va, B_va, C_va = torch.split(x_dbl_va, [self.dt_rank_v, self.d_state, self.d_state], dim=-1)
 
-            print('dt_va.shape', dt_va.shape)
-            print('B_va.shape', B_va.shape)
-            print('C_va.shape', C_va.shape)
+            # print('dt_va.shape', dt_va.shape)
+            # print('B_va.shape', B_va.shape)
+            # print('C_va.shape', C_va.shape)
 
             dt_va = self.dt_proj_v.weight @ dt_va.t()
-            print('dt_va.shape', dt_va.shape)
+            # print('dt_va.shape', dt_va.shape)
 
             dt_va = rearrange(dt_va, "d (b l) -> b d l", l=seqlen_a)
             B_va = rearrange(B_va, "(b l) dstate -> b dstate l", l=seqlen_v).contiguous()
             C_va = rearrange(C_va, "(b l) dstate -> b dstate l", l=seqlen_v).contiguous()
 
-            print('dt_va.shape', dt_va.shape)
-            print('B_va.shape', B_va.shape)
-            print('C_va.shape', C_va.shape)
+            # print('dt_va.shape', dt_va.shape)
+            # print('B_va.shape', B_va.shape)
+            # print('C_va.shape', C_va.shape)
 
             assert self.activation in ["silu", "swish"]
             y_va = selective_scan_fn(
@@ -538,8 +549,6 @@ class Mamba(nn.Module):
             y_va = rearrange(y_va, "b d l -> b l d")
             out_va = self.out_proj_a(y_va)
 
-
-            exit()
         return out_a, out_v, out_av, out_va
 
     def step(self, hidden_states_a, hidden_states_v, conv_state, ssm_state):
