@@ -113,6 +113,12 @@ class Mamba(nn.Module):
         self.activation = "silu"
         self.act = nn.SiLU()
 
+        # print(self.d_inner_a)
+        # print(self.dt_rank_a)
+        # print(self.d_state)
+        # 1024
+        # 32
+        # 16
         self.x_proj_a = nn.Linear(
             self.d_inner_a, self.dt_rank_a + self.d_state * 2, bias=False, **factory_kwargs
         )
@@ -175,7 +181,7 @@ class Mamba(nn.Module):
         elif dt_init == "random":
             nn.init.uniform_(self.dt_proj_v.weight, -dt_init_std_v, dt_init_std_v)
         else:
-            raise NotImplementedErro
+            raise NotImplementedError
 
         # Initialize dt bias so that F.softplus(dt_bias) is between dt_min and dt_max
         dt_v = torch.exp(
@@ -360,7 +366,7 @@ class Mamba(nn.Module):
             # We want dt to have d as the slowest moving dimension
             # and L as the fastest moving dimension, since those are what the ssm_scan kernel expects.
             x_dbl_a = self.x_proj_a(rearrange(x_a, "b d l -> (b l) d"))  # (bl d)  #         self.x_proj = nn.Linear(self.d_inner, self.dt_rank + self.d_state * 2, bias=False, **factory_kwargs)
-            # x_dbl_a.shape torch.Size([1280, 33])
+            # x_dbl_a.shape= torch.Size([160, 64])
             # print('x_dbl_a.shape', x_dbl_a.shape)
 
             # linear_layer = nn.Linear(in_features=33, out_features=33, bias=True)
@@ -369,7 +375,6 @@ class Mamba(nn.Module):
 
 
             dt_a, B_a, C_a = torch.split(x_dbl_a, [self.dt_rank_a, self.d_state, self.d_state], dim=-1)
-
             dt_a = self.dt_proj_a.weight @ dt_a.t()
             dt_a = rearrange(dt_a, "d (b l) -> b d l", l=seqlen_a)
             B_a = rearrange(B_a, "(b l) dstate -> b dstate l", l=seqlen_a).contiguous()
